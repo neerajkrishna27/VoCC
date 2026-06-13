@@ -1,0 +1,593 @@
+
+# Multi-variate climate analog velocity (Distance-Based velocity)
+  
+# Load required rasters
+library (VoCC)
+library(terra)
+library(data.table)
+library(ggplot2)
+library(scales)
+library(geometry)      # chull
+library(geosphere)     # distHaversine
+library(viridis)
+library(dplyr)
+library(sp)
+library(tidyterra)
+library(openxlsx)      # Excel export  (install.packages("openxlsx"))
+library(ggrepel)       # label repulsion in biplots
+library(RColorBrewer)
+
+# 1. set path and directory
+# >>> Edit these two blocks; everything else is automatic <<<
+
+scenario_tag <- "ssp_scenario_years"   # used in folder name & file names
+
+present_path <- "Path to present climatic variables."
+future_path  <- "Path to future climatic variables."
+
+base_path    <- "path to output folder"
+output_path  <- file.path(base_path, "results", scenario_tag)
+dir.create(output_path, recursive = TRUE, showWarnings = FALSE)
+
+# Helper: build output filename  (no trailing slash issue)
+out_file <- function(...) file.path(output_path, paste0(...))
+
+# 2. load rasters
+p_files <- list.files(present_path, pattern = "\\.tif$", full.names = TRUE)
+f_files <- list.files(future_path,  pattern = "\\.tif$", full.names = TRUE)
+if (length(p_files) == 0) stop("No present .tif files found in: ", present_path)
+if (length(f_files) == 0) stop("No future .tif files found in: ", future_path)
+
+climp <- rast(p_files)
+climf <- rast(f_files)
+names(climf) <- names(climp)          # align layer names
+message("Loaded ", nlyr(climp), " climate variables.")
+
+# 3.climPCA function
+climPCA <- function(climp, climf, trans = NA, cen = TRUE, sc = TRUE, n_axes = 4) {
+  p_val <- as.matrix(climp)
+  f_val <- as.matrix(climf)
+  
+  cid_vec    <- rep(1:ncell(climp), times = 2)
+  period_vec <- rep(c("present", "future"), each = ncell(climp))
+  
+  clim <- data.table(rbind(p_val, f_val))
+  clim[, `:=`(cid = cid_vec, p = period_vec)]
+  clim_clean <- na.omit(clim)
+  
+  pca_input <- clim_clean[, !c("cid", "p"), with = FALSE]
+  if (!is.logical(trans)) pca_input <- trans(pca_input)
+  
+  pca_res <- prcomp(pca_input, center = cen, scale. = sc)
+  
+  # Cap at available PCs
+  n_pcs <- min(n_axes, ncol(pca_res$x))
+  
+  scores <- data.frame(
+    pca_res$x[, 1:n_pcs],
+    cid = clim_clean$cid,
+    p   = clim_clean$p
+  )
+  
+  v_wide <- reshape(scores, idvar = "cid", timevar = "p", direction = "wide")
+  
+  return(list(pca_obj = pca_res, data = v_wide, n_pcs = n_pcs))
+}
+
+# 4. Run PCA
+results_pca <- climPCA(climp, climf, trans = NA, n_axes = 4)
+pca_obj     <- results_pca$pca_obj
+pca_table   <- results_pca$data
+n_pcs       <- results_pca$n_pcs
+message("Using ", n_pcs, " PC axes.")
+
+# 5. Write PC score rasters
+template <- climp[[1]]
+
+pc_rasters <- list()   # keep in memory for later
+
+for (colname in names(pca_table)) {
+  if (colname == "cid") next
+  out_r <- rast(template)
+  values(out_r) <- NA
+  out_r[pca_table$cid] <- pca_table[[colname]]
+  fname <- out_file(colname, "_", scenario_tag, ".tif")
+  writeRaster(out_r, filename = fname, overwrite = TRUE)
+  pc_rasters[[colname]] <- out_r
+}
+message("PC score rasters saved.")
+
+# 6. Scree plot
+sdev       <- pca_obj$sdev
+prop_var   <- sdev^2 / sum(sdev^2)
+cum_var    <- cumsum(prop_var)
+
+n_show <- min(10, length(sdev))
+var_df <- data.frame(
+  PC       = factor(paste0("PC", 1:n_show), levels = paste0("PC", 1:n_show)),
+  PropVar  = prop_var[1:n_show],
+  CumVar   = cum_var[1:n_show],
+  Selected = c(rep(TRUE, n_pcs), rep(FALSE, max(0, n_show - n_pcs)))
+)
+
+scree_p <- ggplot(var_df, aes(x = PC)) +
+  # bar
+  geom_bar(aes(y = PropVar, fill = Selected), stat = "identity",
+           width = 0.65, color = "grey30", linewidth = 0.3) +
+  # cumulative line
+  geom_line(aes(y = CumVar / max(CumVar) * max(PropVar), group = 1),
+            color = "#2c3e50", linewidth = 0.9, linetype = "dashed") +
+  geom_point(aes(y = CumVar / max(CumVar) * max(PropVar)),
+             color = "#2c3e50", size = 2.5, shape = 21,
+             fill = "white", stroke = 1.2) +
+  # % labels on bars
+  geom_text(aes(y = PropVar,
+                label = paste0(round(PropVar * 100, 1), "%")),
+            vjust = -0.6, size = 3.2, fontface = "bold", color = "grey20") +
+  # highlight selected axes
+  geom_vline(xintercept = n_pcs + 0.5, linetype = "dotted",
+             color = "firebrick", linewidth = 0.7) +
+  annotate("text", x = n_pcs + 0.55, y = max(prop_var) * 0.95,
+           label = paste0("4 axes selected\n(",
+                          round(cum_var[n_pcs] * 100, 1), "% var.)"),
+           hjust = 0, size = 3, color = "firebrick", fontface = "italic") +
+  scale_fill_manual(values = c("TRUE" = "#4E79A7", "FALSE" = "grey75"),
+                    guide = "none") +
+  scale_y_continuous(
+    name   = "Proportion of Total Variance",
+    labels = percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.18)),
+    sec.axis = sec_axis(~ . / max(prop_var),
+                        name   = "Cumulative Variance",
+                        labels = percent_format(accuracy = 1))
+  ) +
+  labs(title    = "Scree Plot — Climate PCA",
+       subtitle = paste0("Scenario: ", scenario_tag,
+                         "  |  Variables: ", nlyr(climp)),
+       x        = "Principal Component Axis",
+       caption  = "Dashed line = cumulative variance; blue bars = selected axes") +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 15, hjust = 0.5),
+    plot.subtitle    = element_text(size = 11, hjust = 0.5, color = "grey40"),
+    axis.title       = element_text(face = "bold"),
+    axis.text        = element_text(color = "grey20"),
+    axis.line        = element_line(color = "grey30"),
+    panel.grid.major.y = element_line(color = "grey90", linetype = "dotted"),
+    plot.caption     = element_text(size = 8, color = "grey50", hjust = 0)
+  )
+
+ggsave(out_file("Scree_Plot_", scenario_tag, ".png"),
+       plot = scree_p, width = 10, height = 7, dpi = 1000)
+message("Scree plot saved.")
+
+# 7. Box plot for the top 3 contributors in each PC axes
+# Loadings (rotation matrix)
+loadings_mat <- pca_obj$rotation[, 1:n_pcs]
+
+# Convert to long data.frame
+loadings_df <- as.data.frame(loadings_mat)
+loadings_df$Variable <- rownames(loadings_mat)
+
+loadings_long <- tidyr::pivot_longer(
+  loadings_df,
+  cols      = starts_with("PC"),
+  names_to  = "PC_Axis",
+  values_to = "Loading"
+)
+loadings_long$PC_Axis <- factor(loadings_long$PC_Axis,
+                                levels = paste0("PC", 1:n_pcs))
+
+# Contribution (%) = loading^2 / sum(loading^2 per PC) * 100
+loadings_long <- loadings_long %>%
+  group_by(PC_Axis) %>%
+  mutate(Contribution_pct = (Loading^2 / sum(Loading^2)) * 100) %>%
+  ungroup()
+
+# 7a. Distribution of loadings per axis
+boxplot_p <- ggplot(loadings_long,
+                    aes(x = PC_Axis, y = Loading, fill = PC_Axis)) +
+  geom_hline(yintercept = 0, color = "grey50", linetype = "dashed",
+             linewidth = 0.5) +
+  geom_boxplot(outlier.shape = 21, outlier.size = 2, outlier.fill = "white",
+               width = 0.5, color = "grey20", linewidth = 0.4, alpha = 0.85) +
+  geom_jitter(aes(color = PC_Axis), width = 0.15, size = 2.2,
+              alpha = 0.7, shape = 16) +
+  ggrepel::geom_text_repel(
+    data = loadings_long %>%
+      group_by(PC_Axis) %>%
+      slice_max(abs(Loading), n = 3),
+    aes(label = Variable), size = 2.8, max.overlaps = 15,
+    box.padding = 0.3, segment.color = "grey60"
+  ) +
+  scale_fill_brewer(palette  = "Set2",  guide = "none") +
+  scale_color_brewer(palette = "Set2",  guide = "none") +
+  facet_wrap(~ PC_Axis, nrow = 1, scales = "free_x") +
+  labs(
+    title    = "Climate Variable Loadings Across 4 PC Axes",
+    subtitle = paste0("Scenario: ", scenario_tag,
+                      "  |  Top 3 contributors labelled per axis"),
+    x        = "Principal Component Axis",
+    y        = "Loading (eigenvector coefficient)",
+    caption  = "Each point represents one climate variable"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey40"),
+    strip.text    = element_text(face = "bold", size = 11),
+    strip.background = element_rect(fill = "grey93", color = NA),
+    axis.text.x  = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid.major.y = element_line(color = "grey92"),
+    plot.caption = element_text(size = 8, color = "grey50")
+  )
+
+ggsave(out_file("Variable_Loadings_Boxplot_", scenario_tag, ".png"),
+       plot = boxplot_p, width = 14, height = 7, dpi = 1000)
+
+# 7b. contribution bar plot per axis
+contrib_p <- ggplot(loadings_long,
+                    aes(x = reorder(Variable, Contribution_pct),
+                        y = Contribution_pct, fill = Contribution_pct)) +
+  geom_col(color = NA) +
+  geom_hline(yintercept = 100 / nrow(loadings_mat),
+             linetype = "dashed", color = "firebrick", linewidth = 0.6) +
+  annotate("text", x = 1.2,
+           y = 100 / nrow(loadings_mat) + 0.3,
+           label = "Expected avg.", hjust = 0,
+           size = 2.6, color = "firebrick") +
+  scale_fill_viridis_c(option = "plasma", name = "Contribution\n(%)") +
+  facet_wrap(~ PC_Axis, ncol = 2, scales = "free_y") +
+  coord_flip() +
+  labs(
+    title    = "Per-Variable Contributions to Each PC Axis",
+    subtitle = paste0("Scenario: ", scenario_tag),
+    x        = "Climate Variable",
+    y        = "Contribution (%)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13, hjust = 0.5),
+    plot.subtitle    = element_text(size = 10, hjust = 0.5, color = "grey40"),
+    strip.background = element_rect(fill = "grey93", color = NA),
+    strip.text       = element_text(face = "bold"),
+    legend.position  = "right",
+    panel.grid.major.x = element_line(color = "grey92")
+  )
+
+ggsave(out_file("Variable_Contributions_Barplot_", scenario_tag, ".png"),
+       plot = contrib_p, width = 14, height = 10, dpi = 1000)
+message("Variable contribution plots saved.")
+
+# 8. Excel report with loadings and their contribution
+wb <- createWorkbook()
+
+#  Sheet 1: Eigenvalues / Variance explained 
+addWorksheet(wb, "Variance_Explained")
+var_exp <- data.frame(
+  PC            = paste0("PC", 1:length(sdev)),
+  Eigenvalue    = round(sdev^2, 4),
+  Prop_Var_pct  = round(prop_var * 100, 3),
+  Cum_Var_pct   = round(cum_var * 100, 3),
+  Selected      = c(rep("YES", n_pcs), rep("", length(sdev) - n_pcs))
+)
+writeDataTable(wb, "Variance_Explained", var_exp, tableStyle = "TableStyleMedium9")
+setColWidths(wb, "Variance_Explained", cols = 1:5,
+             widths = c(8, 14, 16, 14, 10))
+
+# Header style
+hs <- createStyle(fontName = "Arial", fontSize = 11, fontColour = "#FFFFFF",
+                  fgFill = "#2E75B6", halign = "CENTER",
+                  textDecoration = "bold", border = "Bottom")
+addStyle(wb, "Variance_Explained", hs, rows = 1, cols = 1:5, gridExpand = TRUE)
+
+# Sheet 2: Raw Loadings
+addWorksheet(wb, "Loadings")
+load_export <- as.data.frame(round(pca_obj$rotation[, 1:n_pcs], 5))
+load_export <- cbind(Variable = rownames(load_export), load_export)
+rownames(load_export) <- NULL
+writeDataTable(wb, "Loadings", load_export, tableStyle = "TableStyleMedium2")
+setColWidths(wb, "Loadings", cols = 1:(n_pcs + 1),
+             widths = c(22, rep(10, n_pcs)))
+addStyle(wb, "Loadings", hs, rows = 1, cols = 1:(n_pcs + 1), gridExpand = TRUE)
+
+# Conditional formatting: highlight strong loadings (|loading| > 0.4)
+for (pc_col in 2:(n_pcs + 1)) {
+  pos_style <- createStyle(fontColour = "#006100", fgFill = "#C6EFCE")
+  neg_style <- createStyle(fontColour = "#9C0006", fgFill = "#FFC7CE")
+  n_vars <- nrow(load_export)
+  conditionalFormatting(wb, "Loadings",
+                        cols = pc_col, rows = 2:(n_vars + 1),
+                        rule = ">0.4",  style = pos_style, type = "expression")
+  conditionalFormatting(wb, "Loadings",
+                        cols = pc_col, rows = 2:(n_vars + 1),
+                        rule = "<-0.4", style = neg_style, type = "expression")
+}
+
+# Sheet 3: Contributions (%) 
+addWorksheet(wb, "Contributions_pct")
+contrib_wide <- loadings_long %>%
+  select(Variable, PC_Axis, Contribution_pct) %>%
+  tidyr::pivot_wider(names_from = PC_Axis, values_from = Contribution_pct) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+writeDataTable(wb, "Contributions_pct", as.data.frame(contrib_wide),
+               tableStyle = "TableStyleMedium3")
+setColWidths(wb, "Contributions_pct", cols = 1:(n_pcs + 1),
+             widths = c(22, rep(14, n_pcs)))
+addStyle(wb, "Contributions_pct", hs, rows = 1, cols = 1:(n_pcs + 1),
+         gridExpand = TRUE)
+
+# Sheet 4: Scores summary (mean by period) 
+addWorksheet(wb, "Score_Summary")
+# Rebuild long scores for summary
+score_cols_p <- paste0("PC", 1:n_pcs, ".present")
+score_cols_f <- paste0("PC", 1:n_pcs, ".future")
+avail_p <- intersect(score_cols_p, names(pca_table))
+avail_f <- intersect(score_cols_f, names(pca_table))
+
+sum_rows <- lapply(1:n_pcs, function(i) {
+  cp <- paste0("PC", i, ".present")
+  cf <- paste0("PC", i, ".future")
+  if (!(cp %in% names(pca_table))) return(NULL)
+  data.frame(
+    PC         = paste0("PC", i),
+    Mean_Present = round(mean(pca_table[[cp]], na.rm = TRUE), 4),
+    SD_Present   = round(sd(pca_table[[cp]], na.rm = TRUE), 4),
+    Mean_Future  = round(mean(pca_table[[cf]], na.rm = TRUE), 4),
+    SD_Future    = round(sd(pca_table[[cf]], na.rm = TRUE), 4),
+    Delta_Mean   = round(mean(pca_table[[cf]], na.rm = TRUE) -
+                           mean(pca_table[[cp]], na.rm = TRUE), 4)
+  )
+})
+score_summary <- do.call(rbind, Filter(Negate(is.null), sum_rows))
+writeDataTable(wb, "Score_Summary", score_summary,
+               tableStyle = "TableStyleMedium7")
+setColWidths(wb, "Score_Summary", cols = 1:6,
+             widths = c(8, 14, 12, 14, 12, 12))
+addStyle(wb, "Score_Summary", hs, rows = 1, cols = 1:6, gridExpand = TRUE)
+
+# Save workbook
+saveWorkbook(wb,
+             out_file("PCA_Results_", scenario_tag, ".xlsx"),
+             overwrite = TRUE)
+message("Excel workbook saved.")
+
+# 9. load 4 PC axes and prepare datatable
+get_pc <- function(period, ax) {
+  key <- paste0("PC", ax, ".", period)
+  if (!is.null(pc_rasters[[key]])) return(pc_rasters[[key]])
+  # fallback: search on disk
+  pat <- paste0("PC", ax, ".*", period, ".*", scenario_tag, "\\.tif$")
+  f   <- list.files(output_path, pattern = pat, full.names = TRUE)
+  if (length(f) == 0) stop("Cannot find raster for PC", ax, " ", period)
+  rast(f[1])
+}
+
+pc_list <- lapply(1:n_pcs, function(ax) {
+  list(p = get_pc("present", ax), f = get_pc("future", ax))
+})
+
+# Build data table with all 4 axes
+dt_list <- lapply(1:n_pcs, function(ax) {
+  data.table(
+    cid = 1:ncell(pc_list[[ax]]$p),
+    pp  = as.vector(pc_list[[ax]]$p),
+    ff  = as.vector(pc_list[[ax]]$f)
+  )
+})
+# Merge by cid
+xy_data <- Reduce(function(a, b) merge(a, b, by = "cid", suffixes = c("", "")),
+                  lapply(1:n_pcs, function(ax) {
+                    setNames(
+                      data.table(
+                        cid                        = 1:ncell(pc_list[[ax]]$p),
+                        as.vector(pc_list[[ax]]$p),
+                        as.vector(pc_list[[ax]]$f)
+                      ),
+                      c("cid",
+                        paste0("PC", ax, "p"),
+                        paste0("PC", ax, "f"))
+                    )
+                  })
+)
+xy_clean <- na.omit(xy_data)
+
+# 10. Climate categories (Binning) 
+bin_size <- 0.5                         # adjust bin size accordingly 
+
+make_bins <- function(ax) {
+  pv <- xy_clean[[paste0("PC", ax, "p")]]
+  fv <- xy_clean[[paste0("PC", ax, "f")]]
+  r  <- range(c(pv, fv))
+  seq(floor(r[1]), ceiling(r[2]), by = bin_size)
+}
+
+bin_id <- function(ax, period) {
+  col   <- paste0("PC", ax, if (period == "p") "p" else "f")
+  bins  <- make_bins(ax)
+  findInterval(xy_clean[[col]], bins)
+}
+
+# Composite bin string across all 4 axes
+p_id <- do.call(paste, c(lapply(1:n_pcs, bin_id, period = "p"), sep = "_"))
+f_id <- do.call(paste, c(lapply(1:n_pcs, bin_id, period = "f"), sep = "_"))
+
+present_pool <- unique(p_id)
+future_pool  <- unique(f_id)
+
+xy_clean[, type := "Remnant"]
+xy_clean[!(f_id %in% present_pool),    type := "Novel"]
+xy_clean[!(p_id %in% future_pool),     type := "Disappearing"]
+
+# Category raster
+result_rast <- rast(pc_list[[1]]$p); values(result_rast) <- NA
+xy_clean[type == "Remnant",      type_id := 1L]
+xy_clean[type == "Novel",        type_id := 2L]
+xy_clean[type == "Disappearing", type_id := 3L]
+result_rast[xy_clean$cid] <- xy_clean$type_id
+levels(result_rast) <- data.frame(id = 1:3,
+                                  category = c("Remnant","Novel","Disappearing"))
+
+writeRaster(result_rast,
+            out_file("Climate_Categories_4PC_", scenario_tag, ".tif"),
+            overwrite = TRUE)
+
+# 11. Velocity calculation (Convex Hull Method)
+coords <- as.data.frame(xyFromCell(pc_list[[1]]$p, xy_clean$cid))
+tdiff  <- 45  # years between midpoints of present (1985) and future (2090)
+
+pca_pres <- data.table(
+  cid = xy_clean$cid, x = coords$x, y = coords$y,
+  PC1 = xy_clean$PC1p, PC2 = xy_clean$PC2p,
+  PC3 = xy_clean$PC3p, PC4 = xy_clean$PC4p
+)
+pca_fut <- data.table(
+  cid = xy_clean$cid, x = coords$x, y = coords$y,
+  PC1 = xy_clean$PC1f, PC2 = xy_clean$PC2f,
+  PC3 = xy_clean$PC3f, PC4 = xy_clean$PC4f
+)
+
+# Convex hull on first 2 PCs (hull is 2-D by definition)
+hull_mat   <- as.matrix(pca_pres[, .(PC1, PC2)])
+hull_idx   <- chull(hull_mat)
+hull_geom  <- hull_mat[hull_idx, ]
+
+vel_results <- data.table(
+  focal_cid  = pca_fut$cid,
+  target_cid = as.integer(NA),
+  geoDis     = as.double(NA),
+  vel        = as.double(NA),
+  status     = "No-Analog"
+)
+
+is_inside <- sp::point.in.polygon(pca_fut$PC1, pca_fut$PC2,
+                                  hull_geom[, 1], hull_geom[, 2]) > 0
+
+# Pre-compute 4-D PCA distances and find analogs
+pca_pres_mat <- as.matrix(pca_pres[, .(PC1, PC2, PC3, PC4)])
+
+message("Running velocity loop for ", sum(is_inside), " analog cells ...")
+for (i in which(is_inside)) {
+  f_vec    <- as.numeric(pca_fut[i, .(PC1, PC2, PC3, PC4)])
+  pca_dist <- sqrt(rowSums(sweep(pca_pres_mat, 2, f_vec)^2))
+  
+  threshold  <- quantile(pca_dist, 0.05)
+  cand_idx   <- which(pca_dist <= threshold)
+  candidates <- pca_pres[cand_idx]
+  
+  if (nrow(candidates) > 0) {
+    geo_d    <- distHaversine(
+      cbind(pca_fut$x[i],  pca_fut$y[i]),
+      cbind(candidates$x, candidates$y)
+    ) / 1000  # km
+    
+    best     <- which.min(geo_d)
+    vel_results[i, `:=`(
+      target_cid = candidates$cid[best],
+      geoDis     = geo_d[best],
+      vel        = geo_d[best] / tdiff,
+      status     = "Analog Found"
+    )]
+  }
+}
+message("Velocity loop complete.")
+
+# 12. Export velocity rasters
+r_vel  <- rast(pc_list[[1]]$p); values(r_vel)  <- NA
+r_dist <- rast(pc_list[[1]]$p); values(r_dist) <- NA
+r_vel[ vel_results$focal_cid] <- vel_results$vel
+r_dist[vel_results$focal_cid] <- vel_results$geoDis
+
+writeRaster(r_vel,
+            out_file("Analog_Velocity_kmyr_", scenario_tag, ".tif"),
+            overwrite = TRUE)
+writeRaster(r_dist,
+            out_file("Geographic_Distance_km_", scenario_tag, ".tif"),
+            overwrite = TRUE)
+
+# 13. Climate category map
+cat_map <- ggplot() +
+  geom_spatraster(data = result_rast) +
+  scale_fill_manual(
+    values   = c("Remnant" = "darkseagreen",
+                 "Novel"   = "#2F4F4F",
+                 "Disappearing" = "red4"),
+    na.value = "transparent",
+    name     = "Climate\nCategory"
+  ) +
+  labs(
+    title    = "Climate Analog Categories — location",
+    subtitle = paste0("Scenario: ", scenario_tag,
+                      "  |  4 PC axes (", round(cum_var[n_pcs]*100,1), "% variance)"),
+    x        = "Longitude", y = "Latitude"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey40"),
+    legend.position    = "right",
+    legend.title       = element_text(face = "bold"),
+    panel.grid         = element_blank(),
+    axis.line          = element_blank(),
+    panel.border       = element_rect(color = "grey30", fill = NA)
+  )
+
+ggsave(out_file("Climate_Categories_Map_", scenario_tag, ".png"),
+       plot = cat_map, width = 10, height = 8, dpi = 1000)
+
+# 1. Velocity Map
+vel_df  <- as.data.frame(r_vel,  xy = TRUE, na.rm = TRUE)
+dis_cat <- as.data.frame(result_rast, xy = TRUE, na.rm = TRUE)
+dis_cat <- dis_cat[dis_cat$category == "Disappearing", ]
+
+vel_map <- ggplot() +
+  geom_raster(data = vel_df,
+              aes(x = x, y = y, fill = lyr1)) +
+  scale_fill_viridis_c(option = "inferno", name = "Velocity\n(km/yr)",
+                       na.value = "transparent",
+                       guide = guide_colorbar(barheight = 8)) +
+  {if (nrow(dis_cat) > 0)
+    geom_raster(data = dis_cat, aes(x = x, y = y),
+                fill = "#8B1A1A", alpha = 0.45)} +
+  labs(
+    title    = "Climate Analog Velocity",
+    subtitle = paste0("Scenario: ", scenario_tag,
+                      "  |  Dark red overlay = Disappearing climates"),
+    x        = "Longitude", y = "Latitude"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey40"),
+    panel.border  = element_rect(color = "grey30", fill = NA),
+    axis.line     = element_blank()
+  )
+
+ggsave(out_file("Velocity_Map_", scenario_tag, ".png"),
+       vel_map, width = 10, height = 8, dpi = 1000)
+
+# 15. Summary statistics 
+cat_summary <- xy_clean[, .N, by = type]
+cat_summary[, Percent := round(N / sum(N) * 100, 2)]
+
+vel_summary <- vel_results[status == "Analog Found",
+                           .(Mean_vel   = round(mean(vel,    na.rm = TRUE), 3),
+                             Median_vel  = round(median(vel,  na.rm = TRUE), 3),
+                             SD_vel      = round(sd(vel,      na.rm = TRUE), 3),
+                             Max_vel     = round(max(vel,     na.rm = TRUE), 3),
+                             Mean_dist   = round(mean(geoDis, na.rm = TRUE), 3))]
+
+addWorksheet(wb, "Analog_Summary")
+writeData(wb, "Analog_Summary", cat_summary)
+writeData(wb, "Analog_Summary", vel_summary, startRow = nrow(cat_summary) + 3)
+saveWorkbook(wb,
+             out_file("PCA_Results_", scenario_tag, ".xlsx"),
+             overwrite = TRUE)
+
+message("\n ==Analysis completed ==")
+message("All outputs saved in: ", output_path)
+message("\nCategory summary:")
+print(cat_summary)
+message("\nVelocity summary (analog cells only):")
+print(vel_summary)
