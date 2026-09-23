@@ -1,0 +1,82 @@
+
+// ==============================
+// 1. LOAD STUDY AREA
+// ==============================
+var studyArea = ee.FeatureCollection(table); 
+
+Map.centerObject(studyArea);
+
+
+// ==============================
+// 2. LOAD ERA5 LAND DATA
+// ==============================
+var dataset = ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY_AGGR")
+                .select("temperature_2m")
+                .filterBounds(studyArea)
+                .filterDate("1951-01-01", "2024-12-31");
+
+
+// ==============================
+// 3. ANNUAL MEAN (°C)
+// ==============================
+var startYear = 1951;
+var endYear = 2024;
+
+var years = ee.List.sequence(startYear, endYear);
+
+var annualCollection = ee.ImageCollection.fromImages(
+  years.map(function(year){
+
+    year = ee.Number(year);
+
+    var annualMean = dataset
+      .filter(ee.Filter.calendarRange(year, year, 'year'))
+      .mean()
+      
+      // Kelvin → Celsius
+      .subtract(273.15)
+      
+      .rename("temp_mean_C")
+      
+      .clip(studyArea)
+      
+      .set("year", year);
+
+    return annualMean;
+  })
+);
+
+print("Annual collection:", annualCollection);
+
+
+// ==============================
+// 4. EXPORT EACH YEAR TO DRIVE
+// ==============================
+
+years.getInfo().forEach(function(year){
+
+  var image = annualCollection
+                .filter(ee.Filter.eq("year", year))
+                .first();
+
+  Export.image.toDrive({
+
+    image: image,
+
+    description: "ERA5Land_Temp" + year,
+
+    folder: "ERA5Land_temp",
+
+    fileNamePrefix: "AnnualMean_" + year,
+
+    region: studyArea.geometry(),
+
+    scale: 10000,   // ERA5 Land resolution ≈ 9 km
+
+    crs: "EPSG:4326",
+
+    maxPixels: 1e13
+
+  });
+
+});
