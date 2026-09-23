@@ -17,9 +17,7 @@ library(openxlsx)      # Excel export  (install.packages("openxlsx"))
 library(ggrepel)       # label repulsion in biplots
 library(RColorBrewer)
 
-# 1. set path and directory
-# >>> Edit these two blocks; everything else is automatic <<<
-
+# 1. Load path and directory
 scenario_tag <- "ssp_scenario_years"   # used in folder name & file names
 
 present_path <- "Path to present climatic variables."
