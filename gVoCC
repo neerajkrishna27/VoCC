@@ -24,7 +24,7 @@ grad_threshold  <- 0.0001
 is_projected    <- FALSE # FALSE = geographic (lon/lat, degrees); TRUE = projected
 
 # 2. Load and stack climate files
-message("Loading precipitation rasters ...")
+message("Loading precipitation rasters")
 clim_files <- sort(list.files(climate_dir, pattern = "\\.tif$", full.names = TRUE))
 if (length(clim_files) == 0) stop("No .tif files found in climate_dir.")
 
@@ -33,7 +33,7 @@ message(sprintf("  Stack dimensions: %d rows x %d cols x %d layers",
                 nrow(clim_stack), ncol(clim_stack), nlayers(clim_stack)))
 
 # 3. Load Forest Mask
-message("Loading forest mask ...")
+message("Loading forest mask")
 forest <- raster(forest_path)
 
 # 4. Align CRS
@@ -41,18 +41,18 @@ clim_crs   <- crs(clim_stack)
 forest_crs <- crs(forest)
 
 if (!compareCRS(clim_crs, forest_crs)) {
-  message("CRS mismatch detected. Reprojecting forest mask ...")
-  forest <- projectRaster(forest, crs = clim_crs, method = "ngb")
+  message("CRS mismatch detected. Reprojecting forest mask")
+  forest <- projectRaster(forest, crs = clim_crs, method = "bilinear")
 }
 
 # 5. Resample forest cover into that of climate rasters
 message("Resampling forest mask ...")
-forest_resampled <- resample(forest, clim_stack[[1]], method = "ngb")
+forest_resampled <- resample(forest, clim_stack[[1]], method = "bilinear")
 forest_mask <- forest_resampled
 forest_mask[forest_mask[] == 0] <- NA   
 
 # 6. Crop and Mask climate files
-message("Cropping and masking climate stack to forest extent ...")
+message("Cropping and masking climate stack to forest extent")
 clim_cropped <- crop(clim_stack, extent(forest_mask))
 clim_masked  <- mask(clim_cropped, forest_mask)
 yrClim       <- clim_masked
@@ -318,4 +318,4 @@ ggsave(
   bg = "white"
 )
 
-message(sprintf("Success! Your publication map has been saved to:\n%s", output_file))
+
